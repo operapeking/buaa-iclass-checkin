@@ -5,8 +5,8 @@
 本项目整合了 `duaa` 的两阶段 cron 工作流，以及 `BUAASignTool` 的 WebVPN / iClass 访问方式：
 
 1. 每天早上查询当天课表；
-2. 为当天每节未签到课程注册一次性 cron 任务；
-3. 在每节课上课 **10 分钟后** 自动通过 WebVPN 执行签到。
+2. 根据配置为当天每节未签到课程注册一次性 cron 任务；
+3. 在配置指定的时间点自动通过 WebVPN 执行签到。
 
 > 请严格遵循学校相关规章制度，合理使用本工具。不要用于恶意并发请求或破坏系统稳定性的行为。
 
@@ -16,7 +16,8 @@
 - 通过 `d.buaa.edu.cn` WebVPN 访问 iClass；
 - 支持校外服务器运行；
 - 每天自动获取当天课程；
-- 每门课上课后 10 分钟自动签到；
+- 支持配置是否启用自动签到；
+- 支持配置签到时间：上课前 10 分钟到下课前 1 分钟；
 - 签到前会再次检查课程状态，已签则跳过；
 - 支持按课程 ID / 排课 ID / 课程名过滤。
 
@@ -35,14 +36,22 @@ cp config.example.json config.json
     "student_id": "你的学号",
     "password": "统一身份认证密码",
     "course_ids": [],
-    "sign_delay_minutes": 10
+    "auto_checkin": {
+        "enabled": true,
+        "offset_minutes": 10
+    }
 }
 ```
 
 说明：
 
 - `course_ids`: 空数组表示所有课程；也可以填写课程 ID、排课 ID 或课程名。
-- `sign_delay_minutes`: 上课后多少分钟签到，默认 10。
+- `auto_checkin.enabled`: 是否启用自动签到。设为 `false` 时，每天只查询并缓存课表，不注册课程签到任务。
+- `auto_checkin.offset_minutes`: 以课程开始时间为基准的签到偏移分钟数：
+  - `-10` 表示上课前 10 分钟；
+  - `0` 表示上课铃响时；
+  - `10` 表示上课后 10 分钟；
+  - 允许范围：上课前 10 分钟到下课前 1 分钟。
 
 运行安装脚本：
 
@@ -52,38 +61,38 @@ bash install.sh
 
 安装脚本会：
 
-- 安装 Python 依赖：`requests`、`beautifulsoup4`；
+- 检查或安装 Python 依赖：`requests`、`beautifulsoup4`；
 - 设置每日 07:00 查询课表的 cron 任务。
 
 ## 使用
 
-手动查询当天课表并注册签到任务：
+手动查询当天课表并按配置注册签到任务：
 
 ```bash
-python3 buasign.py --query
+python3 iclass_checkin.py --query
 ```
 
 查看已注册的签到任务：
 
 ```bash
-python3 buasign.py --show-cron
+python3 iclass_checkin.py --show-cron
 ```
 
 清除所有本工具创建的签到任务：
 
 ```bash
-python3 buasign.py --clear-cron
+python3 iclass_checkin.py --clear-cron
 ```
 
 手动执行某节课签到：
 
 ```bash
-python3 buasign.py --checkin <student_id> <schedule_id>
+python3 iclass_checkin.py --checkin <student_id> <schedule_id>
 ```
 
 ## 日志与状态
 
-- 日志文件：`buasign.log`
+- 日志文件：`iclass-checkin.log`
 - 课表缓存：`state/`
 
 这些运行时文件不会被 Git 提交。

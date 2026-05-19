@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-buasign - BUAA 自动签到工具 (WebVPN CLI)
+BUAA iClass Checkin - 北航 iClass 自动签到工具 (WebVPN CLI)
 
 两阶段工作流:
-  Phase 1 (--query):  查询当天课表，为每节课添加 cron 定时任务
+  Phase 1 (--query):  查询当天课表，根据配置为每节课添加 cron 定时任务
   Phase 2 (--checkin): 执行签到
 
-签到时机: 每节课上课时间 +10 分钟
+签到时机由 config.json 的 auto_checkin.offset_minutes 控制，范围为:
+  上课前 10 分钟 (-10) 到下课前 1 分钟。
 """
 
 import argparse
@@ -34,9 +35,12 @@ VPN_SERVICE_ID = "77726476706e69737468656265737421f9f44d9d342326526b0988e29d5136
 API_8347 = f"{VPN_BASE}/https-8347/{VPN_SERVICE_ID}"
 API_8081 = f"{VPN_BASE}/http-8081/{VPN_SERVICE_ID}"
 
-CRON_MARKER = "buasign"
+COURSE_CRON_MARKER = "buaa-iclass-checkin-course"
+DAILY_CRON_MARKER = "buaa-iclass-checkin-daily-query"
 SCRIPT_PATH = os.path.abspath(__file__)
-SIGN_DELAY_MINUTES = 10  # 上课后 10 分钟签到
+DEFAULT_AUTO_CHECKIN_ENABLED = True
+DEFAULT_CHECKIN_OFFSET_MINUTES = 10  # 上课后 10 分钟签到
+MIN_CHECKIN_OFFSET_MINUTES = -10  # 最早上课前 10 分钟
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -213,6 +217,82 @@ def get_script_dir() -> str:
     return os.path.dirname(SCRIPT_PATH)
 
 
+def course_cron_managed(line: str) -> bool:
+    """判断 crontab 行是否是本工具创建的课程签到任务。"""
+    return COURSE_CRON_MARKER in line
+
+
+def cron_managed(line: str) -> bool:
+    """判断 crontab 行是否由本工具创建。"""
+    return COURSE_CRON_MARKER in line or DAILY_CRON_MARKER in line
+
+
+def parse_class_time(value: str) -> datetime.datetime | None:
+    """兼容 iClass 返回的两种常见时间格式。"""
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return datetime.datetime.strptime(value, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def get_auto_checkin_config(cfg: dict) -> tuple[bool, int]:
+    """读取自动签到配置。
+
+    推荐格式:
+      "auto_checkin": {"enabled": true, "offset_minutes": 10}
+    """
+    auto = cfg.get("auto_checkin", {})
+    if auto is None:
+        auto = {}
+    if not isinstance(auto, dict):
+        raise ValueError("auto_checkin 必须是对象，例如 {\"enabled\": true, \"offset_minutes\": 10}")
+
+    enabled = bool(auto.get("enabled", DEFAULT_AUTO_CHECKIN_ENABLED))
+    offset = auto.get("offset_minutes", DEFAULT_CHECKIN_OFFSET_MINUTES)
+    try:
+        offset = int(offset)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("auto_checkin.offset_minutes 必须是整数分钟") from exc
+
+    if offset < MIN_CHECKIN_OFFSET_MINUTES:
+        raise ValueError("auto_checkin.offset_minutes 不能早于上课前 10 分钟，即不能小于 -10")
+
+    return enabled, offset
+
+
+def validate_checkin_time(course: dict, offset_minutes: int) -> tuple[datetime.datetime | None, str | None]:
+    """计算并校验签到时间。
+
+    offset_minutes 以课程开始时间为基准:
+      -10 表示上课前 10 分钟;
+       10 表示上课后 10 分钟。
+
+    可用范围是 [上课前 10 分钟, 下课前 1 分钟]。
+    """
+    begin = parse_class_time(course.get("classBeginTime", ""))
+    end = parse_class_time(course.get("classEndTime", ""))
+    name = course.get("courseName", "?")
+
+    if begin is None:
+        return None, f"[{name}] 无法解析上课时间: {course.get('classBeginTime', '')}"
+    if end is None:
+        return None, f"[{name}] 无法解析下课时间: {course.get('classEndTime', '')}"
+
+    sign_dt = begin + datetime.timedelta(minutes=offset_minutes)
+    earliest = begin + datetime.timedelta(minutes=MIN_CHECKIN_OFFSET_MINUTES)
+    latest = end - datetime.timedelta(minutes=1)
+    if sign_dt < earliest or sign_dt > latest:
+        return None, (
+            f"[{name}] 签到时间 {sign_dt.strftime('%H:%M')} 超出允许范围 "
+            f"({earliest.strftime('%H:%M')} - {latest.strftime('%H:%M')})"
+        )
+    return sign_dt, None
+
+
 # ─── Phase 1: 查询课表 + 注册 cron ─────────────────────
 
 def phase_query(config_path: str, state_dir: str):
@@ -220,6 +300,12 @@ def phase_query(config_path: str, state_dir: str):
     student_id = cfg["student_id"]
     password = cfg["password"]
     course_ids = cfg.get("course_ids", [])  # 空列表 = 全部课程
+
+    try:
+        auto_enabled, checkin_offset = get_auto_checkin_config(cfg)
+    except ValueError as exc:
+        log(f"配置错误: {exc}", "ERROR")
+        sys.exit(1)
 
     client = BUASignClient(student_id, password)
     if not client.login():
@@ -231,6 +317,27 @@ def phase_query(config_path: str, state_dir: str):
     courses = client.get_schedule(today)
     if not courses:
         log("今天没有课程")
+        return
+
+    # 缓存课表到本地 (Phase 2 可用于展示课程名)
+    os.makedirs(state_dir, exist_ok=True)
+    cache_file = os.path.join(state_dir, f"schedule_{today}.json")
+    with open(cache_file, "w") as f:
+        json.dump(courses, f, ensure_ascii=False)
+
+    # 读取现有 crontab，并清理本工具当天生成的旧任务
+    existing = ""
+    try:
+        existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
+    except subprocess.CalledProcessError:
+        pass
+    new_lines = [line for line in existing.splitlines() if not course_cron_managed(line)]
+
+    if not auto_enabled:
+        log("自动签到已在配置中关闭，仅缓存课表，不注册课程签到任务")
+        proc = subprocess.run(["crontab", "-"], input="\n".join(new_lines) + "\n", capture_output=True, text=True)
+        if proc.returncode != 0:
+            log(f"写入 crontab 失败: {proc.stderr}", "ERROR")
         return
 
     # 过滤: 只保留目标课程 & 未签到的
@@ -247,61 +354,39 @@ def phase_query(config_path: str, state_dir: str):
 
     if not targets:
         log("今天没有需要签到的课程")
+        proc = subprocess.run(["crontab", "-"], input="\n".join(new_lines) + "\n", capture_output=True, text=True)
+        if proc.returncode != 0:
+            log(f"写入 crontab 失败: {proc.stderr}", "ERROR")
         return
-
-    # 缓存课表到本地 (Phase 2 需要)
-    os.makedirs(state_dir, exist_ok=True)
-    cache_file = os.path.join(state_dir, f"schedule_{today}.json")
-    with open(cache_file, "w") as f:
-        json.dump(courses, f, ensure_ascii=False)
 
     log(f"找到 {len(targets)} 门待签课程，注册 cron 任务...")
 
-    # 获取脚本目录
-    script_dir = get_script_dir()
-    sign_delay = cfg.get("sign_delay_minutes", SIGN_DELAY_MINUTES)
-
-    # 读取现有 crontab
-    existing = ""
-    try:
-        existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
-    except subprocess.CalledProcessError:
-        pass
-
-    new_lines = [l for l in existing.splitlines() if CRON_MARKER not in l]
-
+    registered = 0
     for c in targets:
         sched_id = c["id"]
         name = c.get("courseName", "?")
-        begin_time = c.get("classBeginTime", "")  # "2026-05-19 08:00"
+        begin_time = c.get("classBeginTime", "")
+        end_time = c.get("classEndTime", "")
 
-        if not begin_time:
-            log(f"  [{name}] 缺少上课时间，跳过", "WARN")
+        sign_dt, error = validate_checkin_time(c, checkin_offset)
+        if error:
+            log(f"  {error}，跳过", "WARN")
             continue
 
-        # 上课时间 + sign_delay 分钟 = 签到时间
-        # 兼容 "2026-05-19 08:00" 和 "2026-05-19 08:00:00" 两种格式
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
-            try:
-                dt = datetime.datetime.strptime(begin_time, fmt)
-                break
-            except ValueError:
-                continue
-        else:
-            log(f"  [{name}] 无法解析时间: {begin_time}", "WARN")
-            continue
-        sign_dt = dt + datetime.timedelta(minutes=sign_delay)
         cron_expr = f"{sign_dt.minute} {sign_dt.hour} {sign_dt.day} {sign_dt.month} *"
         cmd = f"{sys.executable} {SCRIPT_PATH} --checkin {student_id} {sched_id} --config {config_path}"
-        line = f"{cron_expr} {cmd}  # {CRON_MARKER}:{student_id}:{sched_id}:{name}"
+        line = f"{cron_expr} {cmd}  # {COURSE_CRON_MARKER}:{student_id}:{sched_id}:{name}"
         new_lines.append(line)
-        log(f"  [{name}] {sign_dt.strftime('%H:%M')} 签到 (上课 {begin_time[11:16]} +{sign_delay}min)")
+        registered += 1
+
+        offset_text = f"上课前 {abs(checkin_offset)}min" if checkin_offset < 0 else f"上课后 {checkin_offset}min"
+        log(f"  [{name}] {sign_dt.strftime('%H:%M')} 签到 ({offset_text}; 课程 {begin_time[11:16]}-{end_time[11:16]})")
 
     # 写回 crontab
     new_crontab = "\n".join(new_lines) + "\n"
     proc = subprocess.run(["crontab", "-"], input=new_crontab, capture_output=True, text=True)
     if proc.returncode == 0:
-        log(f"✓ 已注册 {len(targets)} 个签到任务")
+        log(f"✓ 已注册 {registered} 个签到任务")
     else:
         log(f"写入 crontab 失败: {proc.stderr}", "ERROR")
 
@@ -351,12 +436,12 @@ def phase_checkin(student_id: str, schedule_id: str, config_path: str, state_dir
 # ─── 主入口 ─────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="BUAA 自动签到工具 (WebVPN)")
-    parser.add_argument("--query", action="store_true", help="查询课表并注册 cron 任务")
+    parser = argparse.ArgumentParser(description="BUAA iClass Checkin (WebVPN CLI)")
+    parser.add_argument("--query", action="store_true", help="查询课表并按配置注册 cron 任务")
     parser.add_argument("--checkin", nargs=2, metavar=("STUDENT_ID", "SCHEDULE_ID"), help="执行签到")
     parser.add_argument("--config", default=os.path.join(get_script_dir(), "config.json"), help="配置文件路径")
     parser.add_argument("--state-dir", default=os.path.join(get_script_dir(), "state"), help="状态缓存目录")
-    parser.add_argument("--clear-cron", action="store_true", help="清除所有 buasign 定时任务")
+    parser.add_argument("--clear-cron", action="store_true", help="清除所有本工具定时任务")
     parser.add_argument("--show-cron", action="store_true", help="查看已注册的定时任务")
 
     args = parser.parse_args()
@@ -367,9 +452,9 @@ def main():
             existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
         except subprocess.CalledProcessError:
             pass
-        new_lines = [l for l in existing.splitlines() if CRON_MARKER not in l]
+        new_lines = [l for l in existing.splitlines() if not cron_managed(l)]
         subprocess.run(["crontab", "-"], input="\n".join(new_lines) + "\n", capture_output=True, text=True)
-        log("✓ 已清除所有 buasign 定时任务")
+        log("✓ 已清除所有本工具定时任务")
         return
 
     if args.show_cron:
@@ -378,9 +463,9 @@ def main():
             existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
         except subprocess.CalledProcessError:
             pass
-        jobs = [l for l in existing.splitlines() if CRON_MARKER in l]
+        jobs = [l for l in existing.splitlines() if cron_managed(l)]
         if jobs:
-            print(f"已注册 {len(jobs)} 个签到任务:")
+            print(f"已注册 {len(jobs)} 个定时任务:")
             for j in jobs:
                 print(f"  {j}")
         else:

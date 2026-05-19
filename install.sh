@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# buasign 一键安装脚本
+# BUAA iClass Checkin 一键安装脚本
 # 安装依赖 + 配置每日 07:00 查询课表的 cron
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-SCRIPT_PATH="$SCRIPT_DIR/buasign.py"
+SCRIPT_PATH="$SCRIPT_DIR/iclass_checkin.py"
 CONFIG_PATH="$SCRIPT_DIR/config.json"
-LOG_FILE="$SCRIPT_DIR/buasign.log"
-CRON_MARKER="buasign-daily-query"
+LOG_FILE="$SCRIPT_DIR/iclass-checkin.log"
+CRON_MARKER="buaa-iclass-checkin-daily-query"
 
 log() { echo "[install] $*"; }
 
@@ -59,7 +59,7 @@ if [[ ! -f "$CONFIG_PATH" ]]; then
 fi
 
 # 验证 JSON
-if ! python3 -c "import json; json.load(open('$CONFIG_PATH'))" 2>/dev/null; then
+if ! "$PYTHON_BIN" -c "import json; json.load(open('$CONFIG_PATH'))" 2>/dev/null; then
     log "ERROR: 配置文件不是有效 JSON: $CONFIG_PATH"
     exit 1
 fi
@@ -93,11 +93,11 @@ log "  配置: $CONFIG_PATH"
 log "  日志: $LOG_FILE"
 log ""
 log "  手动测试:"
-log "    python3 $SCRIPT_PATH --query"
+log "    $PYTHON_BIN $SCRIPT_PATH --query"
 log ""
 log "  查看定时任务:"
-log "    python3 $SCRIPT_PATH --show-cron"
+log "    $PYTHON_BIN $SCRIPT_PATH --show-cron"
 log ""
 log "  清除所有任务:"
-log "    python3 $SCRIPT_PATH --clear-cron"
+log "    $PYTHON_BIN $SCRIPT_PATH --clear-cron"
 log ""
