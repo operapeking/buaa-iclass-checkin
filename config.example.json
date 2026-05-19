@@ -4,6 +4,6 @@
     "course_ids": [],
     "auto_checkin": {
         "enabled": true,
-        "offset_minutes": 10
+        "offset_minutes": 45
     }
 }
