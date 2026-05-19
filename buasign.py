@@ -1,0 +1,400 @@
+#!/usr/bin/env python3
+"""
+buasign - BUAA 自动签到工具 (WebVPN CLI)
+
+两阶段工作流:
+  Phase 1 (--query):  查询当天课表，为每节课添加 cron 定时任务
+  Phase 2 (--checkin): 执行签到
+
+签到时机: 每节课上课时间 +10 分钟
+"""
+
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+import time
+
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("[ERROR] 缺少依赖，请先运行: pip install requests beautifulsoup4")
+    sys.exit(1)
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# ─── 常量 ───────────────────────────────────────────────
+
+VPN_BASE = "https://d.buaa.edu.cn"
+VPN_SERVICE_ID = "77726476706e69737468656265737421f9f44d9d342326526b0988e29d51367ba018"
+API_8347 = f"{VPN_BASE}/https-8347/{VPN_SERVICE_ID}"
+API_8081 = f"{VPN_BASE}/http-8081/{VPN_SERVICE_ID}"
+
+CRON_MARKER = "buasign"
+SCRIPT_PATH = os.path.abspath(__file__)
+SIGN_DELAY_MINUTES = 10  # 上课后 10 分钟签到
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/134.0.0.0 Safari/537.36"
+)
+
+# ─── 日志 ───────────────────────────────────────────────
+
+def log(msg, level="INFO"):
+    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[{ts}] [{level}] {msg}")
+
+
+# ─── 认证 ───────────────────────────────────────────────
+
+class BUASignClient:
+    """WebVPN + iClass 认证客户端"""
+
+    def __init__(self, student_id: str, password: str):
+        self.student_id = student_id
+        self.password = password
+        self.session = requests.Session()
+        self.session.trust_env = False
+        self.session.verify = False
+        self.session.headers.update({
+            "User-Agent": UA,
+            "Accept": "application/json, text/html;q=0.9, */*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9",
+        })
+        self.user_id = None
+        self.session_id = None
+        self.server_time_offset_ms = 0
+
+    def login(self) -> bool:
+        """CAS 登录 + iClass 登录"""
+        if not self._cas_login():
+            return False
+        return self._iclass_login()
+
+    def _cas_login(self) -> bool:
+        """通过统一身份认证登录 WebVPN"""
+        log("正在连接 SSO 认证服务...")
+        try:
+            r = self.session.get(VPN_BASE, timeout=15)
+            r.raise_for_status()
+        except Exception as e:
+            log(f"SSO 连接失败: {e}", "ERROR")
+            return False
+
+        soup = BeautifulSoup(r.text, "html.parser")
+        execution_input = soup.find("input", {"name": "execution"})
+        if not execution_input:
+            log("无法解析 SSO 页面", "ERROR")
+            return False
+
+        execution = execution_input["value"]
+        login_url = r.url
+
+        log("正在登录...")
+        try:
+            r2 = self.session.post(
+                login_url,
+                data={
+                    "username": self.student_id,
+                    "password": self.password,
+                    "execution": execution,
+                    "_eventId": "submit",
+                    "lt": "",
+                    "dllt": "userNamePasswordLogin",
+                    "csrfToken": "",
+                },
+                timeout=15,
+                allow_redirects=True,
+            )
+        except Exception as e:
+            log(f"CAS 登录请求失败: {e}", "ERROR")
+            return False
+
+        # 判断是否登录成功: 成功后应跳转到 VPN 首页
+        if VPN_BASE in r2.url and "/login" not in r2.url:
+            log("✓ CAS 登录成功")
+            return True
+
+        log("CAS 登录失败，请检查账号密码", "ERROR")
+        return False
+
+    def _iclass_login(self) -> bool:
+        """通过 WebVPN 登录 iClass"""
+        log("正在登录 iClass...")
+        try:
+            r = self.session.get(
+                f"{API_8347}/app/user/login.action",
+                params={
+                    "phone": self.student_id,
+                    "userLevel": "1",
+                    "verificationType": "2",
+                    "verificationUrl": "",
+                },
+                timeout=15,
+            )
+            data = r.json()
+        except Exception as e:
+            log(f"iClass 登录失败: {e}", "ERROR")
+            return False
+
+        if str(data.get("STATUS")) != "0":
+            log(f"iClass 登录失败: {data.get('ERRMSG', 'unknown')}", "ERROR")
+            return False
+
+        self.user_id = data["result"]["id"]
+        self.session_id = data["result"]["sessionId"]
+
+        # 同步服务器时间
+        try:
+            r_ts = self.session.get(f"{API_8081}/app/common/get_timestamp.action", timeout=10)
+            ts_data = r_ts.json()
+            self.server_time_offset_ms = int(ts_data.get("timestamp", 0)) - int(time.time() * 1000)
+        except Exception:
+            self.server_time_offset_ms = 0
+
+        log(f"✓ iClass 登录成功 (userId={self.user_id})")
+        return True
+
+    def get_schedule(self, date_str: str) -> list:
+        """获取指定日期的课程表"""
+        try:
+            r = self.session.get(
+                f"{API_8347}/app/course/get_stu_course_sched.action",
+                params={"dateStr": date_str, "id": self.user_id},
+                headers={"sessionId": self.session_id},
+                timeout=15,
+            )
+            data = r.json()
+            if str(data.get("STATUS")) == "0":
+                return data.get("result", [])
+        except Exception as e:
+            log(f"获取课表失败: {e}", "ERROR")
+        return []
+
+    def sign(self, schedule_id: str) -> tuple[bool, str]:
+        """执行签到，返回 (成功, 消息)"""
+        ts = str(int(time.time() * 1000) + self.server_time_offset_ms)
+        try:
+            r = self.session.post(
+                f"{API_8081}/app/course/stu_scan_sign.action",
+                params={"id": self.user_id, "courseSchedId": schedule_id, "timestamp": ts},
+                headers={"sessionId": self.session_id},
+                timeout=15,
+            )
+            data = r.json()
+            status = str(data.get("STATUS"))
+            msg = data.get("ERRMSG", "")
+            if status == "0":
+                return True, msg or "签到成功"
+            if "已签到" in msg:
+                return True, "已签到"
+            return False, msg or "签到失败"
+        except Exception as e:
+            return False, str(e)
+
+
+# ─── 配置 ───────────────────────────────────────────────
+
+def load_config(path: str) -> dict:
+    if not os.path.exists(path):
+        log(f"配置文件不存在: {path}", "ERROR")
+        sys.exit(1)
+    with open(path) as f:
+        return json.load(f)
+
+
+def get_script_dir() -> str:
+    return os.path.dirname(SCRIPT_PATH)
+
+
+# ─── Phase 1: 查询课表 + 注册 cron ─────────────────────
+
+def phase_query(config_path: str, state_dir: str):
+    cfg = load_config(config_path)
+    student_id = cfg["student_id"]
+    password = cfg["password"]
+    course_ids = cfg.get("course_ids", [])  # 空列表 = 全部课程
+
+    client = BUASignClient(student_id, password)
+    if not client.login():
+        sys.exit(1)
+
+    today = datetime.datetime.now().strftime("%Y%m%d")
+    log(f"查询 {today} 课表...")
+
+    courses = client.get_schedule(today)
+    if not courses:
+        log("今天没有课程")
+        return
+
+    # 过滤: 只保留目标课程 & 未签到的
+    targets = []
+    for c in courses:
+        if str(c.get("signStatus")) == "1":
+            continue
+        cid = c.get("courseId", "")
+        sid = c.get("id", "")
+        name = c.get("courseName", "?")
+        if course_ids and cid not in course_ids and sid not in course_ids and name not in course_ids:
+            continue
+        targets.append(c)
+
+    if not targets:
+        log("今天没有需要签到的课程")
+        return
+
+    # 缓存课表到本地 (Phase 2 需要)
+    os.makedirs(state_dir, exist_ok=True)
+    cache_file = os.path.join(state_dir, f"schedule_{today}.json")
+    with open(cache_file, "w") as f:
+        json.dump(courses, f, ensure_ascii=False)
+
+    log(f"找到 {len(targets)} 门待签课程，注册 cron 任务...")
+
+    # 获取脚本目录
+    script_dir = get_script_dir()
+    sign_delay = cfg.get("sign_delay_minutes", SIGN_DELAY_MINUTES)
+
+    # 读取现有 crontab
+    existing = ""
+    try:
+        existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
+    except subprocess.CalledProcessError:
+        pass
+
+    new_lines = [l for l in existing.splitlines() if CRON_MARKER not in l]
+
+    for c in targets:
+        sched_id = c["id"]
+        name = c.get("courseName", "?")
+        begin_time = c.get("classBeginTime", "")  # "2026-05-19 08:00"
+
+        if not begin_time:
+            log(f"  [{name}] 缺少上课时间，跳过", "WARN")
+            continue
+
+        # 上课时间 + sign_delay 分钟 = 签到时间
+        # 兼容 "2026-05-19 08:00" 和 "2026-05-19 08:00:00" 两种格式
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+            try:
+                dt = datetime.datetime.strptime(begin_time, fmt)
+                break
+            except ValueError:
+                continue
+        else:
+            log(f"  [{name}] 无法解析时间: {begin_time}", "WARN")
+            continue
+        sign_dt = dt + datetime.timedelta(minutes=sign_delay)
+        cron_expr = f"{sign_dt.minute} {sign_dt.hour} {sign_dt.day} {sign_dt.month} *"
+        cmd = f"{sys.executable} {SCRIPT_PATH} --checkin {student_id} {sched_id} --config {config_path}"
+        line = f"{cron_expr} {cmd}  # {CRON_MARKER}:{student_id}:{sched_id}:{name}"
+        new_lines.append(line)
+        log(f"  [{name}] {sign_dt.strftime('%H:%M')} 签到 (上课 {begin_time[11:16]} +{sign_delay}min)")
+
+    # 写回 crontab
+    new_crontab = "\n".join(new_lines) + "\n"
+    proc = subprocess.run(["crontab", "-"], input=new_crontab, capture_output=True, text=True)
+    if proc.returncode == 0:
+        log(f"✓ 已注册 {len(targets)} 个签到任务")
+    else:
+        log(f"写入 crontab 失败: {proc.stderr}", "ERROR")
+
+
+# ─── Phase 2: 执行签到 ─────────────────────────────────
+
+def phase_checkin(student_id: str, schedule_id: str, config_path: str, state_dir: str):
+    cfg = load_config(config_path)
+    password = cfg["password"]
+
+    today = datetime.datetime.now().strftime("%Y%m%d")
+    cache_file = os.path.join(state_dir, f"schedule_{today}.json")
+
+    # 查缓存获取课程名
+    course_name = schedule_id
+    if os.path.exists(cache_file):
+        with open(cache_file) as f:
+            courses = json.load(f)
+        for c in courses:
+            if c.get("id") == schedule_id:
+                course_name = c.get("courseName", schedule_id)
+                break
+
+    client = BUASignClient(student_id, password)
+    if not client.login():
+        log(f"[{course_name}] 登录失败", "ERROR")
+        sys.exit(1)
+
+    # 检查是否已签到
+    courses = client.get_schedule(today)
+    for c in courses:
+        if c.get("id") == schedule_id:
+            if str(c.get("signStatus")) == "1":
+                log(f"[{course_name}] 已签到，跳过")
+                return
+            break
+
+    # 执行签到
+    ok, msg = client.sign(schedule_id)
+    if ok:
+        log(f"[{course_name}] ✓ {msg}")
+    else:
+        log(f"[{course_name}] ✗ {msg}", "ERROR")
+        sys.exit(1)
+
+
+# ─── 主入口 ─────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(description="BUAA 自动签到工具 (WebVPN)")
+    parser.add_argument("--query", action="store_true", help="查询课表并注册 cron 任务")
+    parser.add_argument("--checkin", nargs=2, metavar=("STUDENT_ID", "SCHEDULE_ID"), help="执行签到")
+    parser.add_argument("--config", default=os.path.join(get_script_dir(), "config.json"), help="配置文件路径")
+    parser.add_argument("--state-dir", default=os.path.join(get_script_dir(), "state"), help="状态缓存目录")
+    parser.add_argument("--clear-cron", action="store_true", help="清除所有 buasign 定时任务")
+    parser.add_argument("--show-cron", action="store_true", help="查看已注册的定时任务")
+
+    args = parser.parse_args()
+
+    if args.clear_cron:
+        existing = ""
+        try:
+            existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
+        except subprocess.CalledProcessError:
+            pass
+        new_lines = [l for l in existing.splitlines() if CRON_MARKER not in l]
+        subprocess.run(["crontab", "-"], input="\n".join(new_lines) + "\n", capture_output=True, text=True)
+        log("✓ 已清除所有 buasign 定时任务")
+        return
+
+    if args.show_cron:
+        existing = ""
+        try:
+            existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
+        except subprocess.CalledProcessError:
+            pass
+        jobs = [l for l in existing.splitlines() if CRON_MARKER in l]
+        if jobs:
+            print(f"已注册 {len(jobs)} 个签到任务:")
+            for j in jobs:
+                print(f"  {j}")
+        else:
+            print("暂无签到任务")
+        return
+
+    if args.query:
+        phase_query(args.config, args.state_dir)
+    elif args.checkin:
+        student_id, schedule_id = args.checkin
+        phase_checkin(student_id, schedule_id, args.config, args.state_dir)
+    else:
+        parser.print_help()
+
+
+if __name__ == "__main__":
+    main()

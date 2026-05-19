@@ -1,0 +1,19 @@
+# local config / secrets
+config.json
+*.local.json
+.env
+
+# runtime state / logs
+state/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/

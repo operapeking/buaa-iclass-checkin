@@ -1,0 +1,6 @@
+{
+    "student_id": "your_student_id",
+    "password": "your_sso_password",
+    "course_ids": [],
+    "sign_delay_minutes": 10
+}
