@@ -8,11 +8,17 @@ BUAA iClass Checkin - 北航 iClass 自动签到工具 (WebVPN CLI)
 
 签到时机由 config.json 的 auto_checkin.offset_minutes 控制，范围为:
   上课前 10 分钟 (-10) 到下课前 1 分钟。
+
+新增功能:
+  - 签到重试: 可恢复错误自动重试 (最多 3 次, 间隔 30 秒)
+  - Session 持久化: 避免每次都重新登录 WebVPN/CAS
+  - 日志写文件: 所有日志同时输出到控制台和日志文件
 """
 
 import argparse
 import datetime
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -48,11 +54,54 @@ UA = (
     "Chrome/134.0.0.0 Safari/537.36"
 )
 
+# 签到重试参数
+SIGN_MAX_RETRIES = 3       # 最大重试次数
+SIGN_RETRY_DELAY = 30      # 每次重试间隔 (秒)
+
 # ─── 日志 ───────────────────────────────────────────────
 
+_logger = None
+
+
+def setup_logger(log_file: str) -> logging.Logger:
+    """配置日志: 同时输出到控制台和文件。"""
+    global _logger
+    if _logger is not None:
+        return _logger
+
+    logger = logging.getLogger("iclass_checkin")
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    fmt = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s",
+                            datefmt="%Y-%m-%d %H:%M:%S")
+
+    # 控制台
+    sh = logging.StreamHandler()
+    sh.setLevel(logging.INFO)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+
+    # 文件
+    log_dir = os.path.dirname(log_file)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(logging.DEBUG)
+    fh.setFormatter(fmt)
+    logger.addHandler(fh)
+
+    _logger = logger
+    return logger
+
+
 def log(msg, level="INFO"):
-    ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{ts}] [{level}] {msg}")
+    """兼容旧用法的日志函数。"""
+    if _logger is not None:
+        getattr(_logger, level.lower(), _logger.info)(msg)
+    else:
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] [{level}] {msg}")
 
 
 # ─── 认证 ───────────────────────────────────────────────
@@ -60,7 +109,7 @@ def log(msg, level="INFO"):
 class BUASignClient:
     """WebVPN + iClass 认证客户端"""
 
-    def __init__(self, student_id: str, password: str):
+    def __init__(self, student_id: str, password: str, session_file: str = None):
         self.student_id = student_id
         self.password = password
         self.session = requests.Session()
@@ -74,9 +123,12 @@ class BUASignClient:
         self.user_id = None
         self.session_id = None
         self.server_time_offset_ms = 0
+        self.session_file = session_file
 
     def login(self) -> bool:
-        """CAS 登录 + iClass 登录"""
+        """CAS 登录 + iClass 登录 (优先恢复缓存 session)"""
+        if self.restore_session():
+            return True
         if not self._cas_login():
             return False
         return self._iclass_login()
@@ -163,7 +215,74 @@ class BUASignClient:
             self.server_time_offset_ms = 0
 
         log(f"✓ iClass 登录成功 (userId={self.user_id})")
+        self.save_session()
         return True
+
+    def save_session(self):
+        """持久化 session cookies 到文件。"""
+        if not self.session_file:
+            return
+        data = {
+            "cookies": dict(self.session.cookies),
+            "user_id": self.user_id,
+            "session_id": self.session_id,
+            "server_time_offset_ms": self.server_time_offset_ms,
+            "saved_at": time.time(),
+        }
+        try:
+            session_dir = os.path.dirname(self.session_file)
+            if session_dir:
+                os.makedirs(session_dir, exist_ok=True)
+            with open(self.session_file, "w") as f:
+                json.dump(data, f, ensure_ascii=False)
+            log(f"Session 已保存到 {self.session_file}", "DEBUG")
+        except Exception as e:
+            log(f"保存 session 失败: {e}", "WARN")
+
+    def restore_session(self) -> bool:
+        """从缓存文件恢复 session, 若有效则跳过登录。"""
+        if not self.session_file or not os.path.exists(self.session_file):
+            return False
+
+        try:
+            with open(self.session_file) as f:
+                data = json.load(f)
+        except Exception:
+            return False
+
+        saved_at = data.get("saved_at", 0)
+        # 超过 6 小时的 session 视为过期
+        if time.time() - saved_at > 6 * 3600:
+            log("缓存 session 已过期 (超过 6 小时)", "DEBUG")
+            return False
+
+        try:
+            self.session.cookies.update(data.get("cookies", {}))
+            self.user_id = data.get("user_id")
+            self.session_id = data.get("session_id")
+            self.server_time_offset_ms = data.get("server_time_offset_ms", 0)
+
+            # 验证 session 是否有效: 调用一个轻量 API
+            r = self.session.get(
+                f"{API_8347}/app/course/get_stu_course_sched.action",
+                params={"dateStr": datetime.datetime.now().strftime("%Y%m%d"), "id": self.user_id},
+                headers={"sessionId": self.session_id},
+                timeout=10,
+            )
+            data = r.json()
+            if str(data.get("STATUS")) == "0":
+                log(f"✓ 从缓存恢复 session 成功 (userId={self.user_id})")
+                return True
+        except Exception:
+            pass
+
+        log("缓存 session 无效，重新登录", "DEBUG")
+        # 清除无效的缓存
+        try:
+            os.remove(self.session_file)
+        except OSError:
+            pass
+        return False
 
     def get_schedule(self, date_str: str) -> list:
         """获取指定日期的课程表"""
@@ -181,8 +300,12 @@ class BUASignClient:
             log(f"获取课表失败: {e}", "ERROR")
         return []
 
-    def sign(self, schedule_id: str) -> tuple[bool, str]:
-        """执行签到，返回 (成功, 消息)"""
+    def sign(self, schedule_id: str) -> tuple[bool, str, bool]:
+        """执行签到，返回 (成功, 消息, 可重试)。
+
+        可重试=True 表示失败是暂时的 (网络/服务未就绪), 可以稍后重试。
+        可重试=False 表示失败是永久的 (参数错误/已过期), 重试无意义。
+        """
         ts = str(int(time.time() * 1000) + self.server_time_offset_ms)
         try:
             r = self.session.post(
@@ -195,12 +318,19 @@ class BUASignClient:
             status = str(data.get("STATUS"))
             msg = data.get("ERRMSG", "")
             if status == "0":
-                return True, msg or "签到成功"
+                return True, msg or "签到成功", False
             if "已签到" in msg:
-                return True, "已签到"
-            return False, msg or "签到失败"
+                return True, "已签到", False
+            # 可恢复: 老师还没发起签到 / 服务暂时不可用
+            if "不是上课时间" in msg or "网络" in msg or "超时" in msg:
+                return False, msg or "签到失败", True
+            # 其他失败 (参数错误、签到已过期等)
+            return False, msg or "签到失败", False
+        except requests.exceptions.RequestException as e:
+            # 网络异常: 可重试
+            return False, str(e), True
         except Exception as e:
-            return False, str(e)
+            return False, str(e), False
 
 
 # ─── 配置 ───────────────────────────────────────────────
@@ -307,7 +437,8 @@ def phase_query(config_path: str, state_dir: str):
         log(f"配置错误: {exc}", "ERROR")
         sys.exit(1)
 
-    client = BUASignClient(student_id, password)
+    session_file = os.path.join(state_dir, "session.json")
+    client = BUASignClient(student_id, password, session_file=session_file)
     if not client.login():
         sys.exit(1)
 
@@ -391,7 +522,7 @@ def phase_query(config_path: str, state_dir: str):
         log(f"写入 crontab 失败: {proc.stderr}", "ERROR")
 
 
-# ─── Phase 2: 执行签到 ─────────────────────────────────
+# ─── Phase 2: 执行签到 (带重试) ─────────────────────────
 
 def phase_checkin(student_id: str, schedule_id: str, config_path: str, state_dir: str):
     cfg = load_config(config_path)
@@ -410,7 +541,8 @@ def phase_checkin(student_id: str, schedule_id: str, config_path: str, state_dir
                 course_name = c.get("courseName", schedule_id)
                 break
 
-    client = BUASignClient(student_id, password)
+    session_file = os.path.join(state_dir, "session.json")
+    client = BUASignClient(student_id, password, session_file=session_file)
     if not client.login():
         log(f"[{course_name}] 登录失败", "ERROR")
         sys.exit(1)
@@ -424,13 +556,17 @@ def phase_checkin(student_id: str, schedule_id: str, config_path: str, state_dir
                 return
             break
 
-    # 执行签到
-    ok, msg = client.sign(schedule_id)
-    if ok:
-        log(f"[{course_name}] ✓ {msg}")
-    else:
-        log(f"[{course_name}] ✗ {msg}", "ERROR")
-        sys.exit(1)
+    # 签到 + 自动重试
+    for attempt in range(1, SIGN_MAX_RETRIES + 1):
+        ok, msg, retryable = client.sign(schedule_id)
+        if ok:
+            log(f"[{course_name}] ✓ {msg}")
+            return
+        if not retryable or attempt == SIGN_MAX_RETRIES:
+            log(f"[{course_name}] ✗ {msg} (第 {attempt}/{SIGN_MAX_RETRIES} 次)", "ERROR")
+            sys.exit(1)
+        log(f"[{course_name}] 第 {attempt}/{SIGN_MAX_RETRIES} 次签到失败: {msg}, {SIGN_RETRY_DELAY}s 后重试...", "WARN")
+        time.sleep(SIGN_RETRY_DELAY)
 
 
 # ─── 主入口 ─────────────────────────────────────────────
@@ -445,6 +581,10 @@ def main():
     parser.add_argument("--show-cron", action="store_true", help="查看已注册的定时任务")
 
     args = parser.parse_args()
+
+    # 初始化日志 (写入 iclass-checkin.log)
+    log_file = os.path.join(args.state_dir, "iclass-checkin.log")
+    setup_logger(log_file)
 
     if args.clear_cron:
         existing = ""

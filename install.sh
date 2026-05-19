@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT_PATH="$SCRIPT_DIR/iclass_checkin.py"
 CONFIG_PATH="$SCRIPT_DIR/config.json"
-LOG_FILE="$SCRIPT_DIR/iclass-checkin.log"
+LOG_FILE="$SCRIPT_DIR/state/iclass-checkin.log"
 CRON_MARKER="buaa-iclass-checkin-daily-query"
 
 log() { echo "[install] $*"; }
