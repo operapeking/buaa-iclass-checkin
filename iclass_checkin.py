@@ -34,6 +34,9 @@ except ImportError:
 import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# iClass API 返回北京时间，服务器是 UTC，统一用北京时间
+BJT = datetime.timezone(datetime.timedelta(hours=8))
+
 # ─── 常量 ───────────────────────────────────────────────
 
 VPN_BASE = "https://d.buaa.edu.cn"
@@ -42,7 +45,6 @@ API_8347 = f"{VPN_BASE}/https-8347/{VPN_SERVICE_ID}"
 API_8081 = f"{VPN_BASE}/http-8081/{VPN_SERVICE_ID}"
 
 COURSE_CRON_MARKER = "buaa-iclass-checkin-course"
-DAILY_CRON_MARKER = "buaa-iclass-checkin-daily-query"
 SCRIPT_PATH = os.path.abspath(__file__)
 DEFAULT_AUTO_CHECKIN_ENABLED = True
 DEFAULT_CHECKIN_OFFSET_MINUTES = 10  # 上课后 10 分钟签到
@@ -100,8 +102,7 @@ def log(msg, level="INFO"):
     if _logger is not None:
         getattr(_logger, level.lower(), _logger.info)(msg)
     else:
-        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{ts}] [{level}] {msg}")
+        print(f"[{level}] {msg}")
 
 
 # ─── 认证 ───────────────────────────────────────────────
@@ -265,7 +266,7 @@ class BUASignClient:
             # 验证 session 是否有效: 调用一个轻量 API
             r = self.session.get(
                 f"{API_8347}/app/course/get_stu_course_sched.action",
-                params={"dateStr": datetime.datetime.now().strftime("%Y%m%d"), "id": self.user_id},
+                params={"dateStr": datetime.datetime.now(BJT).strftime("%Y%m%d"), "id": self.user_id},
                 headers={"sessionId": self.session_id},
                 timeout=10,
             )
@@ -343,27 +344,18 @@ def load_config(path: str) -> dict:
         return json.load(f)
 
 
-def get_script_dir() -> str:
-    return os.path.dirname(SCRIPT_PATH)
-
-
 def course_cron_managed(line: str) -> bool:
     """判断 crontab 行是否是本工具创建的课程签到任务。"""
     return COURSE_CRON_MARKER in line
 
 
-def cron_managed(line: str) -> bool:
-    """判断 crontab 行是否由本工具创建。"""
-    return COURSE_CRON_MARKER in line or DAILY_CRON_MARKER in line
-
-
 def parse_class_time(value: str) -> datetime.datetime | None:
-    """兼容 iClass 返回的两种常见时间格式。"""
+    """兼容 iClass 返回的两种常见时间格式 (均为北京时间)。"""
     if not value:
         return None
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
-            return datetime.datetime.strptime(value, fmt)
+            return datetime.datetime.strptime(value, fmt).replace(tzinfo=BJT)
         except ValueError:
             continue
     return None
@@ -442,7 +434,7 @@ def phase_query(config_path: str, state_dir: str):
     if not client.login():
         sys.exit(1)
 
-    today = datetime.datetime.now().strftime("%Y%m%d")
+    today = datetime.datetime.now(BJT).strftime("%Y%m%d")
     log(f"查询 {today} 课表...")
 
     courses = client.get_schedule(today)
@@ -504,7 +496,9 @@ def phase_query(config_path: str, state_dir: str):
             log(f"  {error}，跳过", "WARN")
             continue
 
-        cron_expr = f"{sign_dt.minute} {sign_dt.hour} {sign_dt.day} {sign_dt.month} *"
+        # sign_dt 是北京时间，crontab 在 UTC 服务器上运行，需转换
+        sign_dt_utc = sign_dt.astimezone(datetime.timezone.utc)
+        cron_expr = f"{sign_dt_utc.minute} {sign_dt_utc.hour} {sign_dt_utc.day} {sign_dt_utc.month} *"
         cmd = f"{sys.executable} {SCRIPT_PATH} --checkin {student_id} {sched_id} --config {config_path}"
         line = f"{cron_expr} {cmd}  # {COURSE_CRON_MARKER}:{student_id}:{sched_id}:{name}"
         new_lines.append(line)
@@ -528,7 +522,7 @@ def phase_checkin(student_id: str, schedule_id: str, config_path: str, state_dir
     cfg = load_config(config_path)
     password = cfg["password"]
 
-    today = datetime.datetime.now().strftime("%Y%m%d")
+    today = datetime.datetime.now(BJT).strftime("%Y%m%d")
     cache_file = os.path.join(state_dir, f"schedule_{today}.json")
 
     # 查缓存获取课程名
@@ -575,8 +569,8 @@ def main():
     parser = argparse.ArgumentParser(description="BUAA iClass Checkin (WebVPN CLI)")
     parser.add_argument("--query", action="store_true", help="查询课表并按配置注册 cron 任务")
     parser.add_argument("--checkin", nargs=2, metavar=("STUDENT_ID", "SCHEDULE_ID"), help="执行签到")
-    parser.add_argument("--config", default=os.path.join(get_script_dir(), "config.json"), help="配置文件路径")
-    parser.add_argument("--state-dir", default=os.path.join(get_script_dir(), "state"), help="状态缓存目录")
+    parser.add_argument("--config", default=os.path.join(os.path.dirname(SCRIPT_PATH), "config.json"), help="配置文件路径")
+    parser.add_argument("--state-dir", default=os.path.join(os.path.dirname(SCRIPT_PATH), "state"), help="状态缓存目录")
     parser.add_argument("--clear-cron", action="store_true", help="清除所有本工具定时任务")
     parser.add_argument("--show-cron", action="store_true", help="查看已注册的定时任务")
 
@@ -592,7 +586,7 @@ def main():
             existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
         except subprocess.CalledProcessError:
             pass
-        new_lines = [l for l in existing.splitlines() if not cron_managed(l)]
+        new_lines = [l for l in existing.splitlines() if not course_cron_managed(l)]
         subprocess.run(["crontab", "-"], input="\n".join(new_lines) + "\n", capture_output=True, text=True)
         log("✓ 已清除所有本工具定时任务")
         return
@@ -603,7 +597,7 @@ def main():
             existing = subprocess.check_output(["crontab", "-l"], stderr=subprocess.DEVNULL).decode()
         except subprocess.CalledProcessError:
             pass
-        jobs = [l for l in existing.splitlines() if cron_managed(l)]
+        jobs = [l for l in existing.splitlines() if course_cron_managed(l)]
         if jobs:
             print(f"已注册 {len(jobs)} 个定时任务:")
             for j in jobs:
